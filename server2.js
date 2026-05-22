@@ -42,13 +42,6 @@ function nullableNum(value) {
   return Number.isFinite(number) ? number : null;
 }
 
-function boolOrDefault(value, fallback = true) {
-  if (value === undefined || value === null) return fallback;
-  if (typeof value === 'boolean') return value;
-  if (typeof value === 'string') return !['false', '0', 'no'].includes(value.toLowerCase());
-  return Boolean(value);
-}
-
 function str(value, fallback = '') {
   if (value === undefined || value === null) return fallback;
   return String(value).trim();
@@ -425,7 +418,6 @@ async function normalizeMealItem(input = {}) {
       isNewFood: false,
       saveAsFood: false,
       nutritionConfidence: input.nutritionConfidence || 'exact',
-      isDataAccurate: boolOrDefault(input.isDataAccurate, true),
       proteinType: input.proteinType || null,
       pairingTags: Array.isArray(input.pairingTags) ? input.pairingTags : []
     };
@@ -439,7 +431,7 @@ async function normalizeMealItem(input = {}) {
 
   let savedFood = null;
 
-  if (input.saveAsFood && foodName && (calories > 0 || protein > 0 || fat > 0 || carbs > 0)) {
+  if (input.saveAsFood && foodName) {
     savedFood = await upsertProduct({
       name: foodName,
       calories,
@@ -472,7 +464,6 @@ async function normalizeMealItem(input = {}) {
     isNewFood: true,
     saveAsFood: !!input.saveAsFood,
     nutritionConfidence: input.nutritionConfidence || 'unknown',
-    isDataAccurate: boolOrDefault(input.isDataAccurate, true),
     proteinType: input.proteinType || null,
     pairingTags: Array.isArray(input.pairingTags) ? input.pairingTags : []
   };
@@ -681,24 +672,47 @@ app.get('/api/foods/suggest', asyncHandler(async (req, res) => {
 
   if (!q) return res.json([]);
 
+  const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const startsWithRegex = new RegExp(`^${escaped}`, 'i');
+  const containsRegex = new RegExp(escaped, 'i');
+
   const exact = await db.collection('foods').find({
-    ...userQuery({ type: 'product' }),
+    ...userQuery(),
+    type: { $in: ['recipe', 'product'] },
     normalizedName: q
-  }).limit(limit).toArray();
-
-  const regex = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-
-  const partial = await db.collection('foods').find({
-    ...userQuery({ type: 'product' }),
-    normalizedName: { $regex: regex },
-    _id: { $nin: exact.map(item => item._id) }
   })
-    .sort({ useCount: -1, name: 1 })
+    .sort({ type: 1, useCount: -1, lastUsed: -1, name: 1 })
+    .limit(limit)
+    .toArray();
+
+  const exactIds = exact.map(item => item._id);
+
+  const startsWith = await db.collection('foods').find({
+    ...userQuery(),
+    type: { $in: ['recipe', 'product'] },
+    normalizedName: { $regex: startsWithRegex },
+    _id: { $nin: exactIds }
+  })
+    .sort({ useCount: -1, lastUsed: -1, name: 1 })
     .limit(Math.max(limit - exact.length, 0))
     .toArray();
 
-  res.json([...exact, ...partial].map(mapDoc));
+  const usedIds = exact.concat(startsWith).map(item => item._id);
+
+  const contains = await db.collection('foods').find({
+    ...userQuery(),
+    type: { $in: ['recipe', 'product'] },
+    normalizedName: { $regex: containsRegex },
+    _id: { $nin: usedIds }
+  })
+    .sort({ useCount: -1, lastUsed: -1, name: 1 })
+    .limit(Math.max(limit - exact.length - startsWith.length, 0))
+    .toArray();
+
+  res.json([...exact, ...startsWith, ...contains].map(mapDoc));
 }));
+
+
 
 app.get('/api/foods/:id', asyncHandler(async (req, res) => {
   const food = await db.collection('foods').findOne({
@@ -924,7 +938,6 @@ app.post('/api/meals', asyncHandler(async (req, res) => {
     protein: item.protein,
     fat: item.fat,
     carbs: item.carbs,
-    isDataAccurate: boolOrDefault(item.isDataAccurate, true),
     date,
     quick: source === 'quickPlus',
     mealEventId: mealId,
