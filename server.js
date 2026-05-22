@@ -431,7 +431,7 @@ async function normalizeMealItem(input = {}) {
 
   let savedFood = null;
 
-  if (input.saveAsFood && foodName && (calories > 0 || protein > 0 || fat > 0 || carbs > 0)) {
+  if (input.saveAsFood && foodName) {
     savedFood = await upsertProduct({
       name: foodName,
       calories,
@@ -672,24 +672,47 @@ app.get('/api/foods/suggest', asyncHandler(async (req, res) => {
 
   if (!q) return res.json([]);
 
+  const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const startsWithRegex = new RegExp(`^${escaped}`, 'i');
+  const containsRegex = new RegExp(escaped, 'i');
+
   const exact = await db.collection('foods').find({
-    ...userQuery({ type: 'product' }),
+    ...userQuery(),
+    type: { $in: ['recipe', 'product'] },
     normalizedName: q
-  }).limit(limit).toArray();
-
-  const regex = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-
-  const partial = await db.collection('foods').find({
-    ...userQuery({ type: 'product' }),
-    normalizedName: { $regex: regex },
-    _id: { $nin: exact.map(item => item._id) }
   })
-    .sort({ useCount: -1, name: 1 })
+    .sort({ type: 1, useCount: -1, lastUsed: -1, name: 1 })
+    .limit(limit)
+    .toArray();
+
+  const exactIds = exact.map(item => item._id);
+
+  const startsWith = await db.collection('foods').find({
+    ...userQuery(),
+    type: { $in: ['recipe', 'product'] },
+    normalizedName: { $regex: startsWithRegex },
+    _id: { $nin: exactIds }
+  })
+    .sort({ useCount: -1, lastUsed: -1, name: 1 })
     .limit(Math.max(limit - exact.length, 0))
     .toArray();
 
-  res.json([...exact, ...partial].map(mapDoc));
+  const usedIds = exact.concat(startsWith).map(item => item._id);
+
+  const contains = await db.collection('foods').find({
+    ...userQuery(),
+    type: { $in: ['recipe', 'product'] },
+    normalizedName: { $regex: containsRegex },
+    _id: { $nin: usedIds }
+  })
+    .sort({ useCount: -1, lastUsed: -1, name: 1 })
+    .limit(Math.max(limit - exact.length - startsWith.length, 0))
+    .toArray();
+
+  res.json([...exact, ...startsWith, ...contains].map(mapDoc));
 }));
+
+
 
 app.get('/api/foods/:id', asyncHandler(async (req, res) => {
   const food = await db.collection('foods').findOne({
